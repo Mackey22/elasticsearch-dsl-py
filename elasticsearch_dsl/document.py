@@ -81,6 +81,9 @@ class DocTypeOptions(object):
     def refresh(self, index=None, using=None):
         self.mapping.update_from_es(index or self.index, using=using or self.using)
 
+    async def async_refresh(self, index=None, using=None):
+        await self.mapping.async_update_from_es(index or self.index, using=using or self.using)
+
     def matches(self, hit):
         if self._matches is not None:
             return self._matches(hit)
@@ -181,6 +184,30 @@ class DocType(ObjectBase):
         """
         es = connections.get_connection(using or cls._doc_type.using)
         doc = es.get(
+            index=index or cls._doc_type.index,
+            doc_type=cls._doc_type.name,
+            id=id,
+            **kwargs
+        )
+        if not doc.get('found', False):
+            return None
+        return cls.from_es(doc)
+
+    @classmethod
+    async def async_get(cls, id, using=None, index=None, **kwargs):
+        """
+        Retrieve a single document from elasticsearch using it's ``id``.
+
+        :arg id: ``id`` of the document to be retireved
+        :arg index: elasticsearch index to use, if the ``DocType`` is
+            associated with an index this can be omitted.
+        :arg using: connection alias to use, defaults to ``'default'``
+
+        Any additional keyword arguments will be passed to
+        ``Elasticsearch.get`` unchanged.
+        """
+        es = connections.get_connection(using or cls._doc_type.using)
+        doc = await es.get(
             index=index or cls._doc_type.index,
             doc_type=cls._doc_type.name,
             id=id,
@@ -295,6 +322,31 @@ class DocType(ObjectBase):
             **doc_meta
         )
 
+    async def async_delete(self, using=None, index=None, **kwargs):
+        """
+        Delete the instance in elasticsearch.
+
+        :arg index: elasticsearch index to use, if the ``DocType`` is
+            associated with an index this can be omitted.
+        :arg using: connection alias to use, defaults to ``'default'``
+
+        Any additional keyword arguments will be passed to
+        ``Elasticsearch.delete`` unchanged.
+        """
+        es = self._get_connection(using)
+        # extract routing etc from meta
+        doc_meta = dict(
+            (k, self.meta[k])
+            for k in DOC_META_FIELDS
+            if k in self.meta
+        )
+        doc_meta.update(kwargs)
+        await es.delete(
+            index=self._get_index(index),
+            doc_type=self._doc_type.name,
+            **doc_meta
+        )
+
     def to_dict(self, include_meta=False, skip_empty=True):
         """
         Serialize the instance into a dictionary so that it can be saved in elasticsearch.
@@ -386,6 +438,67 @@ class DocType(ObjectBase):
             if '_' + k in meta:
                 setattr(self.meta, k, meta['_' + k])
 
+
+    async def async_update(self, using=None, index=None,  detect_noop=True,
+               doc_as_upsert=False, refresh=False, **fields):
+        """
+        Partial update of the document, specify fields you wish to update and
+        both the instance and the document in elasticsearch will be updated::
+
+            doc = MyDocument(title='Document Title!')
+            doc.save()
+            doc.update(title='New Document Title!')
+
+        :arg index: elasticsearch index to use, if the ``DocType`` is
+            associated with an index this can be omitted.
+        :arg using: connection alias to use, defaults to ``'default'``
+
+        Any additional keyword arguments will be passed to
+        ``Elasticsearch.update`` unchanged.
+        """
+        if not fields:
+            raise IllegalOperation('You cannot call update() without updating individual fields. '
+                                   'If you wish to update the entire object use save().')
+
+        es = self._get_connection(using)
+
+        # update given fields locally
+        merge(self, fields)
+
+        # prepare data for ES
+        values = self.to_dict()
+
+        # if fields were given: partial update
+        doc = dict(
+            (k, values.get(k))
+            for k in fields.keys()
+        )
+
+        # extract routing etc from meta
+        doc_meta = dict(
+            (k, self.meta[k])
+            for k in DOC_META_FIELDS
+            if k in self.meta
+        )
+        body = {
+            'doc': doc,
+            'doc_as_upsert': doc_as_upsert,
+            'detect_noop': detect_noop,
+        }
+
+        meta = await es.update(
+            index=self._get_index(index),
+            doc_type=self._doc_type.name,
+            body=body,
+            refresh=refresh,
+            **doc_meta
+        )
+        # update meta information from ES
+        for k in META_FIELDS:
+            if '_' + k in meta:
+                setattr(self.meta, k, meta['_' + k])
+
+
     def save(self, using=None, index=None, validate=True, **kwargs):
         """
         Save the document into elasticsearch. If the document doesn't exist it
@@ -417,6 +530,45 @@ class DocType(ObjectBase):
             body=self.to_dict(),
             **doc_meta
         )
+        # update meta information from ES
+        for k in META_FIELDS:
+            if '_' + k in meta:
+                setattr(self.meta, k, meta['_' + k])
+
+        # return True/False if the document has been created/updated
+        return meta['result'] == 'created'
+
+    async def async_save(self,
+                   using=None,
+                   index=None,
+                   validate=True,
+                   **kwargs):
+        """
+        Save the document into elasticsearch. If the document doesn't exist it
+        is created, it is overwritten otherwise. Returns ``True`` if this
+        operations resulted in new document being created.
+
+        :arg index: elasticsearch index to use, if the ``DocType`` is
+            associated with an index this can be omitted.
+        :arg using: connection alias to use, defaults to ``'default'``
+        :arg validate: set to ``False`` to skip validating the document
+
+        Any additional keyword arguments will be passed to
+        ``Elasticsearch.index`` unchanged.
+        """
+        if validate:
+            self.full_clean()
+
+        es = self._get_connection(using)
+        # extract routing etc from meta
+        doc_meta = dict(
+            (k, self.meta[k]) for k in DOC_META_FIELDS if k in self.meta)
+        doc_meta.update(kwargs)
+        meta = await es.index(
+            index=self._get_index(index),
+            doc_type=self._doc_type.name,
+            body=self.to_dict(),
+            **doc_meta)
         # update meta information from ES
         for k in META_FIELDS:
             if '_' + k in meta:
