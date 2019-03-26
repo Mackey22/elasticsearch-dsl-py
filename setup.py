@@ -25,6 +25,7 @@ tests_require = [
     "pytest-cov",
     "pytz",
     "coverage<5.0.0"
+    "pytest-asyncio",
 ]
 
 # use external unittest for 2.6

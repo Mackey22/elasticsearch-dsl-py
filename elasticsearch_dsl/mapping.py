@@ -141,6 +141,12 @@ class Mapping(object):
         _, raw = raw.popitem()
         self._update_from_dict(raw['mappings'])
 
+    async def async_update_from_es(self, index, using='default'):
+        es = connections.get_connection(using)
+        raw = await es.indices.get_mapping(index=index, doc_type=self.doc_type)
+        _, raw = raw.popitem()
+        self._update_from_dict(raw['mappings'])
+
     def _update_from_dict(self, raw):
         raw = raw[self.doc_type]
         for name, definition in iteritems(raw.get('properties', {})):
